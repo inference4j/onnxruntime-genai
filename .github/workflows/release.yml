@@ -1,0 +1,197 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  ORT_VERSION: "1.23.0"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            ort_asset: onnxruntime-linux-x64
+            cmake_generator: Ninja
+            build_py_extra_args: ""
+
+          - os: macos-latest
+            ort_asset: onnxruntime-osx-arm64
+            cmake_generator: Unix Makefiles
+            build_py_extra_args: ""
+
+          - os: windows-latest
+            ort_asset: onnxruntime-win-x64
+            cmake_generator: Visual Studio 17 2022
+            build_py_extra_args: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.x'
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.6'
+
+      - name: Setup Visual Studio 2022
+        if: runner.os == 'Windows'
+        uses: microsoft/setup-msbuild@v1.1
+        with:
+          vs-version: '17.5'
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y ninja-build
+
+      - name: Download ORT release (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          curl -sL "https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ORT_VERSION }}/${{ matrix.ort_asset }}-${{ env.ORT_VERSION }}.tgz" -o ort-release.tgz
+          tar xzf ort-release.tgz
+          mkdir -p ort/lib ort/include
+          cp -r ${{ matrix.ort_asset }}-${{ env.ORT_VERSION }}/lib/* ort/lib/
+          cp -r ${{ matrix.ort_asset }}-${{ env.ORT_VERSION }}/include/* ort/include/
+
+      - name: Download ORT release (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ORT_VERSION }}/${{ matrix.ort_asset }}-${{ env.ORT_VERSION }}.zip" -OutFile ort-release.zip
+          Expand-Archive -Path ort-release.zip -DestinationPath .
+          New-Item -ItemType Directory -Force -Path ort/lib, ort/include
+          Copy-Item -Recurse ${{ matrix.ort_asset }}-${{ env.ORT_VERSION }}/lib/* ort/lib/
+          Copy-Item -Recurse ${{ matrix.ort_asset }}-${{ env.ORT_VERSION }}/include/* ort/include/
+
+      - name: Install Python dependencies
+        run: pip install requests
+
+      - name: Build with build.py
+        shell: bash
+        run: |
+          python3 build.py \
+            --config Release \
+            --build_java \
+            --parallel \
+            --ort_home ort \
+            --skip_wheel \
+            --skip_tests \
+            --skip_examples \
+            --cmake_generator "${{ matrix.cmake_generator }}" \
+            ${{ matrix.build_py_extra_args }}
+
+      - name: Collect native artifacts
+        shell: bash
+        run: |
+          NATIVE_LIB_DIR=$(find build -name "native-lib" -type d | head -1)
+          echo "Found native-lib at: $NATIVE_LIB_DIR"
+          ls -R "$NATIVE_LIB_DIR"
+          mkdir -p staging
+          cp -r "$NATIVE_LIB_DIR"/* staging/
+
+      - name: Upload native libs
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-libs-${{ matrix.ort_asset }}
+          path: staging/
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.6'
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all native lib artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-native-libs
+          pattern: native-libs-*
+
+      - name: Assemble fat native-lib directory
+        run: |
+          mkdir -p native-lib
+          for dir in all-native-libs/native-libs-*/; do
+            cp -r "$dir"/* native-lib/
+          done
+          echo "=== Final native-lib layout ==="
+          find native-lib -type f | sort
+
+      - name: Build and publish to staging
+        working-directory: src/java
+        run: |
+          ./gradlew centralPortalBundle \
+            -DcmakeBuildDir=. \
+            -DnativeLibDir=${{ github.workspace }}/native-lib \
+            -Pversion=${{ steps.version.outputs.VERSION }}
+        env:
+          ORG_GRADLE_PROJECT_signingKey: ${{ secrets.GPG_SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingPassword: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
+
+      - name: Verify JAR contents
+        run: |
+          JAR=$(find src/java/build/staging-deploy -name "onnxruntime-genai-${{ steps.version.outputs.VERSION }}.jar" -not -name "*sources*" -not -name "*javadoc*" | head -1)
+          echo "=== JAR: $JAR ==="
+          jar tf "$JAR" | grep -E '\.(so|dylib|dll)$' | sort
+          echo "=== Total native libs in JAR ==="
+          jar tf "$JAR" | grep -E '\.(so|dylib|dll)$' | wc -l
+
+      - name: Upload to Sonatype Central Portal
+        run: |
+          BUNDLE=src/java/build/central-publishing/central-bundle.zip
+          echo "=== Uploading bundle ($(du -h "$BUNDLE" | cut -f1)) ==="
+          RESPONSE=$(curl --silent --show-error --fail \
+            --request POST \
+            --url 'https://central.sonatype.com/api/v1/publisher/upload?publishingType=AUTOMATIC' \
+            --user '${{ secrets.MAVEN_CENTRAL_USERNAME }}:${{ secrets.MAVEN_CENTRAL_PASSWORD }}' \
+            --form "bundle=@${BUNDLE}")
+          echo "Upload response: $RESPONSE"
+
+      - name: Create GitHub Release
+        run: |
+          if gh release view "${{ github.ref_name }}" &>/dev/null; then
+            echo "Release ${{ github.ref_name }} already exists, skipping creation"
+          else
+            gh release create "${{ github.ref_name }}" --generate-notes --title "${{ github.ref_name }}"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

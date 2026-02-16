@@ -12,10 +12,14 @@ allprojects {
 	}
 }
 
-project.group = "com.microsoft.onnxruntime"
-version = rootProject.file('../../VERSION_INFO').text.trim()
-if (version.endsWith('-dev')) {
-	version = version.replace('-dev', '-SNAPSHOT')
+project.group = "io.github.inference4j"
+if (project.hasProperty('version') && project.property('version') != 'unspecified') {
+	// Version passed via -Pversion=... from the release workflow
+} else {
+	version = rootProject.file('../../VERSION_INFO').text.trim()
+	if (version.endsWith('-dev')) {
+		version = version.replace('-dev', '-SNAPSHOT')
+	}
 }
 
 // cmake runs will inform us of the build directory of the current run
@@ -25,11 +29,11 @@ def cmakeJavaDir = "${cmakeBuildDir}"
 def cmakeNativeLibDir = System.properties['nativeLibDir']
 def cmakeBuildOutputDir = "${cmakeJavaDir}/build"
 
-def mavenUser = System.properties['mavenUser']
-def mavenPwd = System.properties['mavenPwd']
 def mavenArtifactId = useCUDA == null ? project.name : project.name + "_gpu"
 
-def defaultDescription = 'ONNX Runtime GenAI is <TODO>'
+def defaultDescription = 'Community shadow build of ONNX Runtime GenAI Java bindings. ' +
+	'Tracks upstream microsoft/onnxruntime-genai releases. ' +
+	'Will be deprecated when Microsoft publishes official Java artifacts to Maven Central.'
 
 logger.lifecycle("cmakeBuildDir:${cmakeBuildDir}")
 logger.lifecycle("cmakeNativeLibDir:${cmakeNativeLibDir}")
@@ -203,8 +207,7 @@ publishing {
 			pom {
 				name = 'onnxruntime-genai'
 				description = defaultDescription
-				// TODO: Setup https://microsoft.github.io/onnxruntime-genai/ for equivalence with ORT?
-				url = 'https://github.com/microsoft/onnxruntime-genai/'
+				url = 'https://github.com/inference4j/onnxruntime-genai'
 				licenses {
 					license {
 						name = 'MIT License'
@@ -212,20 +215,18 @@ publishing {
 					}
 				}
 				organization {
-					name = 'Microsoft'
-					url = 'https://www.microsoft.com'
+					name = 'inference4j'
+					url = 'https://github.com/inference4j'
 				}
 				scm {
-					connection = 'scm:git:git://github.com:microsoft/onnxruntime-genai.git'
-					developerConnection = 'scm:git:ssh://github.com/microsoft/onnxruntime-genai.git'
-					url = 'https://github.com/microsoft/onnxruntime-genai'
+					connection = 'scm:git:git://github.com/inference4j/onnxruntime-genai.git'
+					developerConnection = 'scm:git:ssh://github.com/inference4j/onnxruntime-genai.git'
+					url = 'https://github.com/inference4j/onnxruntime-genai'
 				}
 				developers {
-					// TODO: Does this need updating?
 					developer {
-						id = 'onnxruntime'
-						name = 'ONNX Runtime'
-						email = 'onnxruntime@microsoft.com'
+						id = 'inference4j'
+						name = 'inference4j contributors'
 					}
 				}
 			}
@@ -233,12 +234,8 @@ publishing {
 	}
 	repositories {
 		maven {
-			name = 'sonatype'
-			url 'https://oss.sonatype.org/service/local/staging/deploy/maven2/'
-			credentials {
-				username mavenUser
-				password mavenPwd
-			}
+			name = 'staging'
+			url = layout.buildDirectory.dir('staging-deploy')
 		}
 	}
 }
@@ -246,9 +243,6 @@ publishing {
 // Generates a task signMavenPublication that will
 // build all artifacts.
 signing {
-	// Queries env vars:
-	// ORG_GRADLE_PROJECT_signingKey
-	// ORG_GRADLE_PROJECT_signingPassword but can be changed to properties
 	def signingKey = findProperty("signingKey")
 	def signingPassword = findProperty("signingPassword")
 	if (signingKey && signingPassword) {
@@ -257,4 +251,11 @@ signing {
 	} else {
 		logger.lifecycle("Signing key not found, skipping signing for local publication.")
 	}
+}
+
+// Create a deployment bundle zip for Sonatype Central Portal upload
+task centralPortalBundle(type: Zip, dependsOn: 'publishMavenPublicationToStagingRepository') {
+	archiveFileName = "central-bundle.zip"
+	destinationDirectory = layout.buildDirectory.dir('central-publishing')
+	from layout.buildDirectory.dir('staging-deploy')
 }
