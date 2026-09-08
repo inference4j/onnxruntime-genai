@@ -26,7 +26,7 @@ jobs:
 
           - os: macos-latest
             ort_asset: onnxruntime-osx-arm64
-            cmake_generator: Unix Makefiles
+            cmake_generator: Ninja
             build_py_extra_args: ""
 
           - os: windows-latest
@@ -72,6 +72,10 @@ jobs:
       - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get install -y ninja-build
+
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew list ninja >/dev/null 2>&1 || brew install ninja
 
       - name: Download ORT release (Unix)
         if: runner.os != 'Windows'
