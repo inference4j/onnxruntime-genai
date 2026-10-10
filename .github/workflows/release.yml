@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  # v0.17.0's .pipelines/packaging.yml: ort_runtime_version (not ort_build_version).
+  ORT_VERSION: '1.28.0'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout publishing infrastructure
+        uses: actions/checkout@v5
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.2.1'
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Expected tag vMAJOR.MINOR.PATCH'; exit 1; }
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download official release JAR and matching sources
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p downloads upstream
+          gh api "repos/microsoft/onnxruntime-genai/releases/tags/v${VERSION}" > downloads/release.json
+          ASSET="onnxruntime-genai-${VERSION}.jar"
+          URL=$(jq -er --arg name "$ASSET" '.assets[] | select(.name == $name) | .browser_download_url' downloads/release.json)
+          DIGEST=$(jq -er --arg name "$ASSET" '.assets[] | select(.name == $name) | .digest' downloads/release.json)
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'Missing upstream SHA-256 digest'; exit 1; }
+          curl --fail --show-error --location --retry 3 "$URL" -o "downloads/$ASSET"
+          printf '%s  %s\n' "${DIGEST#sha256:}" "downloads/$ASSET" | sha256sum --check
+          curl --fail --show-error --location --retry 3 \
+            "https://github.com/microsoft/onnxruntime-genai/archive/refs/tags/v${VERSION}.tar.gz" \
+            -o downloads/source.tar.gz
+          tar xzf downloads/source.tar.gz -C upstream --strip-components=1
+
+      - name: Verify release JAR
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import zipfile
+          version = os.environ['VERSION']
+          with zipfile.ZipFile(f'downloads/onnxruntime-genai-{version}.jar') as jar:
+              assert jar.testzip() is None, 'Corrupt release JAR'
+              manifest = jar.read('META-INF/MANIFEST.MF').decode().splitlines()
+              assert f'Implementation-Version: {version}' in manifest, 'JAR version mismatch'
+              names = set(jar.namelist())
+              assert 'ai/onnxruntime/genai/Model.class' in names, 'Missing Java API'
+              for platform, prefix, suffix in [
+                  ('linux-x64', 'lib', '.so'), ('linux-aarch64', 'lib', '.so'),
+                  ('osx-aarch64', 'lib', '.dylib'),
+                  ('win-x64', '', '.dll'), ('win-aarch64', '', '.dll'),
+              ]:
+                  for library in ('onnxruntime-genai', 'onnxruntime-genai-jni'):
+                      entry = f'ai/onnxruntime/genai/native/{platform}/{prefix}{library}{suffix}'
+                      assert entry in names, f'Missing native library: {entry}'
+          PY
+
+      - name: Sign and bundle upstream artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          ORG_GRADLE_PROJECT_signingKey: ${{ secrets.GPG_SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingPassword: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
+        run: |
+          gradle -p publishing clean centralPortalBundle \
+            -Pversion="$VERSION" \
+            -PupstreamJar="$GITHUB_WORKSPACE/downloads/onnxruntime-genai-${VERSION}.jar" \
+            -PupstreamDir="$GITHUB_WORKSPACE/upstream" \
+            -PonnxruntimeVersion="$ORT_VERSION"
+          cmp "downloads/onnxruntime-genai-${VERSION}.jar" \
+            "publishing/build/staging-deploy/io/github/inference4j/onnxruntime-genai/${VERSION}/onnxruntime-genai-${VERSION}.jar"
+
+      - name: Upload to Sonatype Central Portal
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        run: |
+          TOKEN=$(printf '%s:%s' "$MAVEN_CENTRAL_USERNAME" "$MAVEN_CENTRAL_PASSWORD" | base64 -w0)
+          echo "::add-mask::$TOKEN"
+          DEPLOYMENT_ID=$(curl --silent --show-error --fail \
+            --request POST \
+            --url 'https://central.sonatype.com/api/v1/publisher/upload?publishingType=AUTOMATIC' \
+            --header "Authorization: Bearer $TOKEN" \
+            --form 'bundle=@publishing/build/central-publishing/central-bundle.zip')
+          echo "Sonatype deployment: $DEPLOYMENT_ID"
+          # An accepted upload is not a successful publication. Wait for validation/publication.
+          for attempt in $(seq 1 60); do
+            STATUS=$(curl --silent --show-error --fail --request POST \
+              --header "Authorization: Bearer $TOKEN" \
+              "https://central.sonatype.com/api/v1/publisher/status?id=$DEPLOYMENT_ID")
+            STATE=$(jq -er '.deploymentState' <<< "$STATUS")
+            echo "Sonatype state: $STATE"
+            case "$STATE" in
+              PUBLISHED) exit 0 ;;
+              FAILED) echo "$STATUS"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "Timed out waiting for Sonatype deployment $DEPLOYMENT_ID; inspect it in the Portal before retrying."
+          exit 1
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" &>/dev/null; then
+            echo "Release $GITHUB_REF_NAME already exists, skipping creation"
+          else
+            gh release create "$GITHUB_REF_NAME" --generate-notes --title "$GITHUB_REF_NAME"
+          fi
