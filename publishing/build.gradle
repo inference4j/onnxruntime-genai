@@ -1,0 +1,115 @@
+plugins {
+    id 'base'
+    id 'maven-publish'
+    id 'signing'
+}
+
+group = 'io.github.inference4j'
+
+// This project only packages metadata and documentation; it never builds binaries.
+def upstreamDir = file(providers.gradleProperty('upstreamDir').get())
+def upstreamJar = file(providers.gradleProperty('upstreamJar').get())
+def ortVersion = providers.gradleProperty('onnxruntimeVersion').get()
+if (version == 'unspecified' || !upstreamJar.isFile() ||
+        new File(upstreamDir, 'VERSION_INFO').text.trim() != version.toString()) {
+    throw new GradleException('Provide a release version, its upstream JAR, and matching upstream sources.')
+}
+def javaSources = files(
+    new File(upstreamDir, 'src/java/src/main/java'),
+    new File(upstreamDir, 'src/java/src/main/jvm')
+).asFileTree.matching { include '**/*.java' }
+if (javaSources.isEmpty()) {
+    throw new GradleException('No desktop Java sources found in upstreamDir.')
+}
+
+def sourcesJar = tasks.register('sourcesJar', Jar) {
+    archiveClassifier = 'sources'
+    from new File(upstreamDir, 'src/java/src/main/java')
+    from new File(upstreamDir, 'src/java/src/main/jvm')
+    from(upstreamDir) { include 'LICENSE' }
+}
+
+def javadoc = tasks.register('javadoc', Javadoc) {
+    source javaSources
+    classpath = files(upstreamJar)
+    destinationDir = layout.buildDirectory.dir('docs/javadoc').get().asFile
+    options.encoding = 'UTF-8'
+    options.addStringOption('Xdoclint:none', '-quiet')
+}
+
+def javadocJar = tasks.register('javadocJar', Jar) {
+    archiveClassifier = 'javadoc'
+    from javadoc
+    from(upstreamDir) { include 'LICENSE' }
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            artifactId = 'onnxruntime-genai'
+            artifact upstreamJar
+            artifact sourcesJar
+            artifact javadocJar
+            pom {
+                name = 'onnxruntime-genai'
+                description = 'Community redistribution of the official ONNX Runtime GenAI Java release JAR.'
+                url = 'https://github.com/inference4j/onnxruntime-genai'
+                licenses {
+                    license {
+                        name = 'MIT License'
+                        url = 'https://opensource.org/licenses/MIT'
+                    }
+                }
+                organization {
+                    name = 'inference4j'
+                    url = 'https://github.com/inference4j'
+                }
+                scm {
+                    connection = 'scm:git:https://github.com/microsoft/onnxruntime-genai.git'
+                    developerConnection = 'scm:git:ssh://git@github.com/microsoft/onnxruntime-genai.git'
+                    url = 'https://github.com/microsoft/onnxruntime-genai'
+                    tag = "v${project.version}"
+                }
+                developers {
+                    developer {
+                        id = 'inference4j'
+                        name = 'inference4j contributors'
+                    }
+                }
+                // The release JAR includes GenAI natives but no ONNX Runtime natives.
+                withXml {
+                    def dependency = asNode().appendNode('dependencies').appendNode('dependency')
+                    dependency.appendNode('groupId', 'com.microsoft.onnxruntime')
+                    dependency.appendNode('artifactId', 'onnxruntime')
+                    dependency.appendNode('version', ortVersion)
+                    dependency.appendNode('scope', 'runtime')
+                }
+            }
+        }
+    }
+    repositories {
+        maven {
+            name = 'staging'
+            url = layout.buildDirectory.dir('staging-deploy')
+        }
+    }
+}
+
+signing {
+    def signingKey = findProperty('signingKey')
+    if (signingKey) {
+        useInMemoryPgpKeys(signingKey, findProperty('signingPassword'))
+    }
+    // Unsigned bundles are allowed only when explicitly requested for local checks.
+    required = !providers.gradleProperty('unsigned').map { it.toBoolean() }.getOrElse(false)
+    sign publishing.publications.maven
+}
+
+tasks.register('centralPortalBundle', Zip) {
+    dependsOn 'publishMavenPublicationToStagingRepository'
+    archiveFileName = 'central-bundle.zip'
+    destinationDirectory = layout.buildDirectory.dir('central-publishing')
+    from(layout.buildDirectory.dir('staging-deploy')) {
+        include "io/github/inference4j/onnxruntime-genai/${project.version}/**"
+    }
+}
